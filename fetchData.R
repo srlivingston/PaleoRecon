@@ -33,13 +33,14 @@ get_gage_date_range <- function(gage_id) {
 
 # ---- 2. User settings ----
 gage_id <- "02361000"   # Choctawhatchee River near Newton, AL
-radius <- 2             # degrees around gage for scPDSI extraction
+radius <- 5             # degrees around gage for scPDSI extraction
 # Note: Using ALL available data for calibration (no date restrictions)
 sig_level <- 0.01        # correlation significance threshold
 
 # Output files
 calibration_csv <- paste0("gage", gage_id, "_NADA_calibration.csv")
 reconstruction_csv <- paste0("gage", gage_id, "_NADA_reconstruction.csv")
+all_cells_csv <- paste0("gage", gage_id, "_NADA_all_cells.csv")
 
 # ---- 3. Get gage coordinates ----
 coords <- get_gage_coordinates(gage_id)
@@ -203,6 +204,45 @@ message(nrow(sig_cells), " grid cells passed correlation screening.")
 if (nrow(sig_cells) == 0)
   stop("No significant grid cells found. Try increasing radius or p threshold.")
 
+# ---- 8b. Create spreadsheet with ALL cells and observed flow ----
+# This includes all PDSI cells for ALL years in NADA (starting from earliest year)
+cat("\n=== Creating spreadsheet with all PDSI cells (all years) ===\n")
+
+# Get all PDSI data for all cells in the cropped region (all years, not just overlapping)
+all_cells_all_years <- df_long |>
+  left_join(cell_coords, by = c("x", "y")) |>
+  filter(!is.na(cell_id)) |>  # Only cells in the cropped region
+  dplyr::select(year, cell_id, scpdsi) |>
+  pivot_wider(id_cols = year, names_from = cell_id, values_from = scpdsi) |>
+  arrange(year)
+
+# Get the earliest year in PDSI data
+earliest_pdsi_year <- min(all_cells_all_years$year, na.rm = TRUE)
+cat("Earliest PDSI year:", earliest_pdsi_year, "\n")
+cat("Latest PDSI year:", max(all_cells_all_years$year, na.rm = TRUE), "\n")
+
+# Join with observed flow (flow will be NA for years without flow data)
+all_cells_with_flow <- all_cells_all_years |>
+  left_join(flow |> dplyr::select(year, flow_cfs), by = "year") |>
+  # Reorder columns: year and flow_cfs first, then all PDSI cells
+  dplyr::select(year, flow_cfs, everything()) |>
+  arrange(year)
+
+cat("Created dataframe with", nrow(all_cells_with_flow), "years (from", 
+    earliest_pdsi_year, "CE) and", ncol(all_cells_all_years) - 1, "PDSI cells\n")
+cat("Years with observed flow:", sum(!is.na(all_cells_with_flow$flow_cfs)), "\n")
+cat("Years without observed flow:", sum(is.na(all_cells_with_flow$flow_cfs)), "\n")
+
+# Create cell metadata with coordinates and correlation info for reference
+cell_metadata <- cell_coords |>
+  left_join(corrs, by = c("cell_id", "x", "y")) |>
+  arrange(cell_id) |>
+  mutate(cell_index = row_number(),
+         is_significant = ifelse(cell_id %in% sig_cells$cell_id, "Yes", "No")) |>
+  dplyr::select(cell_index, cell_id, x, y, r, p, is_significant)
+
+cat("Total grid cells:", nrow(cell_metadata), "\n")
+
 # ---- 9. Build predictor matrix ----
 sel_cell_ids <- sig_cells$cell_id
 predictor_df <- df_long |>
@@ -220,7 +260,7 @@ step_model <- stepAIC(full_model, direction = "both", trace = FALSE)
 
 summary(step_model)
 
-# VIF only makes sense with 2+ predictors
+# VIF
 n_predictors <- length(coef(step_model)) - 1  # Exclude intercept
 if (n_predictors >= 2) {
   cat("\nVariance Inflation Factors:\n")
@@ -234,8 +274,19 @@ cat("\nDurbin-Watson test:\n")
 print(dwtest)
 
 # ---- 11. Leave-One-Out Cross-Validation ----
-cv_results <- cv.glm(df_cal, step_model, K = nrow(df_cal))
-cat("LOOCV MSE:", cv_results$delta[1], "\n")
+# Check if model has valid predictions
+pred_cal <- predict(step_model, newdata = df_cal)
+if (any(is.na(pred_cal))) {
+  cat("Warning: Model produces NA predictions for some calibration data\n")
+  cat("Skipping LOOCV\n")
+} else {
+  cv_results <- cv.glm(df_cal, step_model, K = nrow(df_cal))
+  if (is.na(cv_results$delta[1])) {
+    cat("LOOCV MSE: Could not be calculated (possibly due to model issues)\n")
+  } else {
+    cat("LOOCV MSE:", cv_results$delta[1], "\n")
+  }
+}
 
 # ---- 12. Apply model to full scPDSI record ----
 predictor_full <- df_long |>
@@ -248,16 +299,52 @@ predictor_full <- df_long |>
 recon <- predict(step_model, newdata = predictor_full)
 reconstruction_df <- data.frame(year = predictor_full$year, recon_flow = recon)
 
+# Check for NA predictions
+n_na_recon <- sum(is.na(recon))
+if (n_na_recon > 0) {
+  cat("Warning:", n_na_recon, "years have NA reconstructed values (likely missing PDSI data)\n")
+}
+
 # ---- 13. Quantile Mapping Bias Correction ----
-fit <- fitQmapRQUANT(obs = df_cal$flow_cfs,
-                     mod = recon[reconstruction_df$year %in% df_cal$year])
-reconstruction_df$recon_bc <- doQmapRQUANT(reconstruction_df$recon_flow, fit)
+# Only use years with valid reconstructed values for calibration period
+cal_years_mask <- reconstruction_df$year %in% df_cal$year
+recon_cal <- recon[cal_years_mask]
+
+# Filter out NAs for quantile mapping
+valid_mask <- !is.na(recon_cal) & !is.na(df_cal$flow_cfs)
+if (sum(valid_mask) < 10) {
+  cat("Warning: Too few valid values for quantile mapping. Skipping bias correction.\n")
+  reconstruction_df$recon_bc <- reconstruction_df$recon_flow
+} else {
+  tryCatch({
+    fit <- fitQmapRQUANT(obs = df_cal$flow_cfs[valid_mask],
+                         mod = recon_cal[valid_mask])
+    # Apply bias correction only to non-NA values
+    recon_bc <- reconstruction_df$recon_flow
+    valid_recon_mask <- !is.na(reconstruction_df$recon_flow)
+    recon_bc[valid_recon_mask] <- doQmapRQUANT(reconstruction_df$recon_flow[valid_recon_mask], fit)
+    reconstruction_df$recon_bc <- recon_bc
+    cat("Quantile mapping bias correction applied successfully\n")
+  }, error = function(e) {
+    cat("Warning: Quantile mapping failed:", e$message, "\n")
+    cat("Using uncorrected reconstructed values\n")
+    reconstruction_df$recon_bc <<- reconstruction_df$recon_flow
+  })
+}
 
 # ---- 14. Save outputs ----
-write.csv(df_cal, calibration_csv, row.names = FALSE)
-write.csv(reconstruction_df, reconstruction_csv, row.names = FALSE)
+write.csv(df_cal, calibration_csv, row.names = FALSE, na = "")
+write.csv(reconstruction_df, reconstruction_csv, row.names = FALSE, na = "")
+write.csv(all_cells_with_flow, all_cells_csv, row.names = FALSE, na = "")
+
+# Also save cell metadata (cell_id to coordinates mapping)
+cell_metadata_csv <- paste0("gage", gage_id, "_NADA_cell_metadata.csv")
+write.csv(cell_metadata, cell_metadata_csv, row.names = FALSE, na = "")
+
 cat("Saved calibration:", calibration_csv, "\n")
 cat("Saved reconstruction:", reconstruction_csv, "\n")
+cat("Saved all cells data:", all_cells_csv, "\n")
+cat("Saved cell metadata:", cell_metadata_csv, "\n")
 
 # ---- 15. Plot diagnostic ----
 plot(reconstruction_df$year, reconstruction_df$recon_bc, type = "l",
