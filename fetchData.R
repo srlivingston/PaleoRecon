@@ -1,0 +1,269 @@
+# ---- paleo_streamflow_slr_auto.R ----
+# Paleostreamflow reconstruction using NADA scPDSI grids as predictors
+# Following methodology of Tootle et al. (2023)
+# Author: (you)
+
+# ---- Libraries ----
+library(terra)
+library(dataRetrieval)
+library(dplyr)
+library(tidyr)
+library(lubridate)
+library(MASS)
+library(car)
+library(boot)
+library(qmap)
+
+# ---- 1. Helper functions ----
+get_gage_coordinates <- function(gage_id) {
+  site <- readNWISsite(gage_id)
+  lat <- as.numeric(site$dec_lat_va[1])
+  lon <- as.numeric(site$dec_long_va[1])
+  list(lat = lat, lon = lon)
+}
+
+get_gage_date_range <- function(gage_id) {
+  # Query site info to get available date range
+  site_info <- readNWISsite(gage_id)
+  # Get the earliest and latest dates available
+  # Note: readNWISsite may not always have date info, so we'll try to get it from data
+  # For now, request a very wide range and let readNWISdv return what's available
+  list(start = "1900-01-01", end = as.character(Sys.Date()))
+}
+
+# ---- 2. User settings ----
+gage_id <- "02361000"   # Choctawhatchee River near Newton, AL
+radius <- 2             # degrees around gage for scPDSI extraction
+# Note: Using ALL available data for calibration (no date restrictions)
+sig_level <- 0.01        # correlation significance threshold
+
+# Output files
+calibration_csv <- paste0("gage", gage_id, "_NADA_calibration.csv")
+reconstruction_csv <- paste0("gage", gage_id, "_NADA_reconstruction.csv")
+
+# ---- 3. Get gage coordinates ----
+coords <- get_gage_coordinates(gage_id)
+lat <- coords$lat
+lon <- coords$lon
+cat("Gage:", gage_id, "at (", lat, ",", lon, ")\n")
+
+# ---- 4. Download NADA scPDSI ----
+nada_url <- "https://www.ncei.noaa.gov/pub/data/paleo/drought/NAmericanDroughtAtlas.v2/NADAv2-2008.nc"
+nada_file <- basename(nada_url)
+
+if (!file.exists(nada_file)) {
+  message("Downloading NADA scPDSI data (~200 MB)...")
+  download.file(nada_url, nada_file, mode = "wb")
+}
+
+# ---- 5. Load and crop NADA ----
+r <- rast(nada_file)
+bbox <- ext(lon - radius, lon + radius, lat - radius, lat + radius)
+r_sub <- crop(r, bbox)
+layer_names <- names(r_sub)
+
+# Diagnostic: Check layer name format
+cat("First few layer names:", head(layer_names, 5), "\n")
+cat("Total layers:", length(layer_names), "\n")
+
+# Extract years from time dimension or construct from NADA time range
+# NADA v2 covers years 0-2000 CE (2001 years total, but may have fewer layers)
+# Check if raster has time information
+if (has.time(r_sub)) {
+  time_vals <- time(r_sub)
+  # Convert time to years (assuming time is in years or can be converted)
+  if (inherits(time_vals, "Date") || inherits(time_vals, "POSIXt")) {
+    years <- as.integer(format(time_vals, "%Y"))
+  } else {
+    years <- as.integer(time_vals)
+  }
+  cat("Extracted years from time dimension\n")
+} else {
+  n_layers <- nlyr(r_sub)
+  start_year <- 0
+  end_year <- start_year + n_layers - 1
+  years <- start_year:(start_year + n_layers - 1)
+  cat("Constructed years from NADA time range (0 CE to", end_year, "CE)\n")
+}
+
+cat("Extracted years range:", min(years, na.rm = TRUE), "to", max(years, na.rm = TRUE), "\n")
+cat("Sample extracted years:", head(years[!is.na(years)], 10), "\n")
+
+# ---- 6. Convert raster to tidy data frame ----
+df_cells <- as.data.frame(r_sub, xy = TRUE)
+df_long <- df_cells |>
+  pivot_longer(cols = -c(x, y), names_to = "layer", values_to = "scpdsi") |>
+  mutate(year = rep(years, times = nrow(df_cells))) |>
+  drop_na(scpdsi)
+
+cat("Years in df_long after processing:", 
+    min(df_long$year, na.rm = TRUE), "to", max(df_long$year, na.rm = TRUE), "\n")
+cat("Unique years in df_long:", length(unique(df_long$year)), "\n")
+
+# ---- 7. Get USGS streamflow data ----
+# Request ALL available data for the gage (not just calibration period)
+# Using a very wide date range to get all available data
+cat("\n=== Fetching ALL available discharge data for gage", gage_id, "===\n")
+flow_raw <- readNWISdv(siteNumbers = gage_id,
+                       parameterCd = "00060",
+                       startDate = "1900-01-01",  # Very early date to get all available data
+                       endDate = as.character(Sys.Date())) |>  # Current date to get most recent data
+  renameNWISColumns()
+
+# Diagnostic: Check Date column format
+cat("\n=== Discharge Data Diagnostics ===\n")
+cat("Requested date range: 1900-01-01 to", as.character(Sys.Date()), "(to get all available data)\n")
+cat("Note: Using ALL available overlapping years for calibration (no date restrictions)\n")
+cat("Column names:", paste(names(flow_raw), collapse = ", "), "\n")
+cat("Date column class:", class(flow_raw$Date), "\n")
+cat("First few Date values:", head(flow_raw$Date, 5), "\n")
+
+# Ensure Date is in proper Date format
+if (!inherits(flow_raw$Date, "Date")) {
+  flow_raw$Date <- as.Date(flow_raw$Date)
+  cat("Converted Date column to Date format\n")
+}
+
+cat("Raw discharge data date range:", 
+    as.character(min(flow_raw$Date, na.rm = TRUE)), "to", 
+    as.character(max(flow_raw$Date, na.rm = TRUE)), "\n")
+cat("Total daily records:", nrow(flow_raw), "\n")
+cat("Records with flow data:", sum(!is.na(flow_raw$Flow)), "\n")
+cat("Records with missing flow:", sum(is.na(flow_raw$Flow)), "\n")
+
+# Process to annual (March-October mean)
+flow <- flow_raw |>
+  mutate(year = year(Date),
+         month = month(Date)) |>
+  filter(month >= 3 & month <= 10) |>
+  group_by(year) |>
+  summarise(flow_cfs = mean(Flow, na.rm = TRUE),
+            n_months = n(),
+            date_min = min(Date),
+            date_max = max(Date))
+
+cat("\nAnnual flow summary (March-October mean):\n")
+cat("Flow data years:", min(flow$year), "to", max(flow$year), "\n")
+cat("Number of flow years:", nrow(flow), "\n")
+first_year_idx <- which(flow$year == min(flow$year))[1]
+last_year_idx <- which(flow$year == max(flow$year))[1]
+cat("First year date range:", 
+    as.character(flow$date_min[first_year_idx]), "to",
+    as.character(flow$date_max[first_year_idx]), "\n")
+cat("Last year date range:", 
+    as.character(flow$date_min[last_year_idx]), "to",
+    as.character(flow$date_max[last_year_idx]), "\n")
+cat("Years with complete data (6+ months):", 
+    sum(flow$n_months >= 6), "\n")
+cat("Years with incomplete data (<6 months):", 
+    sum(flow$n_months < 6), "\n")
+cat("=====================================\n\n")
+
+# ---- 8. Correlation screening (flow vs scPDSI cells) ----
+flow_years <- flow$year
+df_overlap <- df_long |> filter(year %in% flow_years)
+
+cat("Overlapping years found:", length(unique(df_overlap$year)), "\n")
+if (nrow(df_overlap) > 0) {
+  cat("Sample overlapping years:", head(unique(df_overlap$year), 10), "\n")
+}
+
+# Identify cells by x,y coordinates
+cell_coords <- df_overlap |> 
+  distinct(x, y) |>
+  mutate(cell_id = paste0("cell_", row_number()))
+
+# Check if we have any cells
+if (nrow(cell_coords) == 0) {
+  stop("No overlapping years found between flow data and NADA data.")
+}
+
+df_overlap <- df_overlap |>
+  left_join(cell_coords, by = c("x", "y"))
+
+corrs <- data.frame(cell_id = cell_coords$cell_id, x = cell_coords$x, 
+                    y = cell_coords$y, r = NA, p = NA)
+
+for (i in seq_len(nrow(cell_coords))) {
+  cdat <- df_overlap |> filter(cell_id == cell_coords$cell_id[i])
+  # Select only year and scpdsi columns for merging
+  cdat_subset <- cdat[, c("year", "scpdsi")]
+  merged <- inner_join(flow, cdat_subset, by = "year")
+  if (nrow(merged) > 10) {
+    ct <- cor.test(merged$flow_cfs, merged$scpdsi)
+    corrs$r[i] <- ct$estimate
+    corrs$p[i] <- ct$p.value
+  }
+}
+
+# Keep significant positive cells
+sig_cells <- corrs |> filter(p <= sig_level & r > 0, !is.na(p))
+message(nrow(sig_cells), " grid cells passed correlation screening.")
+
+if (nrow(sig_cells) == 0)
+  stop("No significant grid cells found. Try increasing radius or p threshold.")
+
+# ---- 9. Build predictor matrix ----
+sel_cell_ids <- sig_cells$cell_id
+predictor_df <- df_long |>
+  left_join(cell_coords, by = c("x", "y")) |>
+  filter(cell_id %in% sel_cell_ids) |>
+  dplyr::select(year, cell_id, scpdsi) |>
+  pivot_wider(id_cols = year, names_from = cell_id, values_from = scpdsi)
+
+df_cal <- inner_join(flow, predictor_df, by = "year") |> drop_na()
+
+# ---- 10. Stepwise regression ----
+formula_base <- as.formula(paste("flow_cfs ~", paste(sel_cell_ids, collapse = " + ")))
+full_model <- lm(formula_base, data = df_cal)
+step_model <- stepAIC(full_model, direction = "both", trace = FALSE)
+
+summary(step_model)
+
+# VIF only makes sense with 2+ predictors
+n_predictors <- length(coef(step_model)) - 1  # Exclude intercept
+if (n_predictors >= 2) {
+  cat("\nVariance Inflation Factors:\n")
+  print(vif(step_model))
+} else {
+  cat("\nVIF not calculated: model has only", n_predictors, "predictor(s)\n")
+}
+
+dwtest <- car::durbinWatsonTest(step_model)
+cat("\nDurbin-Watson test:\n")
+print(dwtest)
+
+# ---- 11. Leave-One-Out Cross-Validation ----
+cv_results <- cv.glm(df_cal, step_model, K = nrow(df_cal))
+cat("LOOCV MSE:", cv_results$delta[1], "\n")
+
+# ---- 12. Apply model to full scPDSI record ----
+predictor_full <- df_long |>
+  left_join(cell_coords, by = c("x", "y")) |>
+  filter(cell_id %in% sel_cell_ids) |>
+  dplyr::select(year, cell_id, scpdsi) |>
+  pivot_wider(id_cols = year, names_from = cell_id, values_from = scpdsi) |>
+  arrange(year)
+
+recon <- predict(step_model, newdata = predictor_full)
+reconstruction_df <- data.frame(year = predictor_full$year, recon_flow = recon)
+
+# ---- 13. Quantile Mapping Bias Correction ----
+fit <- fitQmapRQUANT(obs = df_cal$flow_cfs,
+                     mod = recon[reconstruction_df$year %in% df_cal$year])
+reconstruction_df$recon_bc <- doQmapRQUANT(reconstruction_df$recon_flow, fit)
+
+# ---- 14. Save outputs ----
+write.csv(df_cal, calibration_csv, row.names = FALSE)
+write.csv(reconstruction_df, reconstruction_csv, row.names = FALSE)
+cat("Saved calibration:", calibration_csv, "\n")
+cat("Saved reconstruction:", reconstruction_csv, "\n")
+
+# ---- 15. Plot diagnostic ----
+plot(reconstruction_df$year, reconstruction_df$recon_bc, type = "l",
+     main = paste("Paleostreamflow Reconstruction (USGS", gage_id, ")"),
+     xlab = "Year", ylab = "Estimated Flow (cfs)", col = "blue")
+points(df_cal$year, df_cal$flow_cfs, col = "red", pch = 16)
+legend("topright",
+       legend = c("Reconstructed (bias-corrected)", "Observed"),
+       col = c("blue", "red"), lty = c(1, NA), pch = c(NA, 16))
