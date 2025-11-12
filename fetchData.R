@@ -31,6 +31,26 @@ get_gage_date_range <- function(gage_id) {
   list(start = "1900-01-01", end = as.character(Sys.Date()))
 }
 
+add_lagged_predictors <- function(df, cell_cols, lags = c(1, 2)) {
+  # Add lagged values for specified columns
+  # df: dataframe with 'year' column and predictor columns
+  # cell_cols: vector of column names to create lags for
+  # lags: vector of lag periods (e.g., c(1, 2) for 1-year and 2-year lags)
+  
+  df <- df |> arrange(year)
+  
+  for (col in cell_cols) {
+    if (col %in% names(df)) {
+      for (lag in lags) {
+        lag_col_name <- paste0(col, "_lag", lag)
+        df[[lag_col_name]] <- dplyr::lag(df[[col]], n = lag)
+      }
+    }
+  }
+  
+  return(df)
+}
+
 # ---- 2. User settings ----
 gage_id <- "02361000"   # Choctawhatchee River near Newton, AL
 radius <- 5             # degrees around gage for scPDSI extraction
@@ -228,8 +248,16 @@ all_cells_with_flow <- all_cells_all_years |>
   dplyr::select(year, flow_cfs, everything()) |>
   arrange(year)
 
+# Get list of PDSI cell column names (all columns except year and flow_cfs)
+pdsi_cols <- setdiff(names(all_cells_with_flow), c("year", "flow_cfs"))
+
+# Add lagged predictors (t-1 and t-2 years) for all PDSI cells
+cat("Adding lagged predictors (1-year and 2-year lags) for", length(pdsi_cols), "PDSI cells...\n")
+all_cells_with_flow <- add_lagged_predictors(all_cells_with_flow, pdsi_cols, lags = c(1, 2))
+
 cat("Created dataframe with", nrow(all_cells_with_flow), "years (from", 
-    earliest_pdsi_year, "CE) and", ncol(all_cells_all_years) - 1, "PDSI cells\n")
+    earliest_pdsi_year, "CE) and", length(pdsi_cols), "PDSI cells\n")
+cat("Total columns:", ncol(all_cells_with_flow), "(including", length(pdsi_cols) * 2, "lagged predictors)\n")
 cat("Years with observed flow:", sum(!is.na(all_cells_with_flow$flow_cfs)), "\n")
 cat("Years without observed flow:", sum(is.na(all_cells_with_flow$flow_cfs)), "\n")
 
